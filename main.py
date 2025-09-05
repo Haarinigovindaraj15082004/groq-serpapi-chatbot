@@ -7,6 +7,14 @@ from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 
 # ---------------------------
+# Conversation memory (short-term)
+# ---------------------------
+conversation_history = []
+MAX_HISTORY = 6  # only last 6 messages to avoid confusion
+current_entity = {"type": None, "name": None}  # entity tracker
+first_question = None  # store first user question
+
+# ---------------------------
 # 1. Load API keys
 # ---------------------------
 load_dotenv()
@@ -30,18 +38,26 @@ search_tool = SerpAPIWrapper()
 llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 
 # ---------------------------
-# 4. Conversation memory
-# ---------------------------
-conversation_history = []
-
-# ---------------------------
-# 5. Search node (silent fail)
+# 4. Search Node
 # ---------------------------
 def search_node(state: ChatState):
-    """Call SerpAPI, extract top links, and scrape content from websites silently."""
-    query = state["question"]
+    """Call SerpAPI, extract top links, and scrape content from websites."""
+
+    query = state["question"].strip().lower()
+
+    # Handle vague follow-ups
+    vague_queries = ["tell me more", "more details", "i want to know more",
+                     "tell more about it", "more about the movie",
+                     "more about the company", "details please"]
+
+    if any(vq in query for vq in vague_queries) and current_entity["name"]:
+        query = current_entity["name"]
+
+    # Perform search
     search_results = search_tool.results(query)
-    urls = [r['link'] for r in search_results['organic_results'][:5]]
+    urls = []
+    if search_results and "organic_results" in search_results:
+        urls = [r['link'] for r in search_results["organic_results"][:5]]
 
     page_texts = []
     for url in urls:
@@ -50,56 +66,54 @@ def search_node(state: ChatState):
             docs = loader.load()
             page_texts.append(docs[0].page_content[:2000])
         except Exception:
-            # silently ignore failed URLs
             continue
 
     combined_content = "\n\n".join(page_texts) if page_texts else "No content found from top URLs."
+
+    # Update entity if query looks specific
+    if len(state["question"].split()) > 2 and "No content" not in combined_content:
+        current_entity["name"] = state["question"]
+        current_entity["type"] = "general"
+
     return {"search_result": combined_content}
 
 # ---------------------------
-# 6. LLM node with chat memory
+# 5. LLM Node
 # ---------------------------
 def llm_node(state: ChatState):
-    """Generate a polite, friendly response using conversation memory."""
+    """Generate a polite, accurate response using short-term memory."""
+
     query = state["question"]
     context = state["search_result"]
 
-    # Build conversation history text
-    history_text = ""
-    for msg in conversation_history:
-        role = "You" if msg["role"] == "user" else "Chatbot"
-        history_text += f"{role}: {msg['content']}\n"
+    # Use last MAX_HISTORY messages
+    messages = conversation_history[-MAX_HISTORY:]
 
-    prompt = f"""
-You are a very polite, friendly assistant. 
-Respond naturally and conversationally using the conversation history and website content.
+    chat_prompt = [
+        {"role": "system", "content": """You are a polite, helpful assistant.
+Rules:
+1. Use recent conversation to stay on topic.
+2. If the user asks vague follow-ups (like "tell me more"), use last entity.
+3. Never guess; if unsure, ask the user to clarify.
+4. Keep answers accurate and grounded in search results."""}
+    ]
 
-Guidelines:
-- Always provide clear, concise, and structured answers.
-- Avoid irrelevant information or unnecessary details.
-- Focus only on what is directly useful to answer the user's question.
-- If information is missing, respond politely without apologizing excessively or mentioning failed sources.
-- Continue the conversation as if you remember the previous context.
-- End responses politely and encourage further questions.
-- Do NOT include greetings, personal remarks, or repetitive phrases like "I'm happy to help you" or "you asked earlier".
+    for msg in messages:
+        chat_prompt.append({"role": msg["role"], "content": msg["content"]})
 
+    chat_prompt.append({"role": "user", "content": query})
 
-Conversation History:
-{history_text}
+    if context and context != "No content found from top URLs.":
+        chat_prompt.append({
+            "role": "system",
+            "content": f"Extra web context:\n{context[:4000]}"
+        })
 
-Current Question: {query}
-
-Website Content:
-{context[:4000]}
-
-    Chatbot:"""
-
-    response = llm.invoke(prompt)
+    response = llm.invoke(chat_prompt)
     return {"answer": response.content.strip()}
 
-
 # ---------------------------
-# 7. Build LangGraph
+# 6. Build LangGraph
 # ---------------------------
 graph = StateGraph(ChatState)
 graph.add_node("search", search_node)
@@ -110,7 +124,7 @@ graph.add_edge("llm", END)
 app = graph.compile()
 
 # ---------------------------
-# 8. Run the Chatbot
+# 7. Run Chatbot
 # ---------------------------
 print("🤖 Groq + SerpAPI Chatbot ready! Type 'exit' to quit.\n")
 
@@ -120,17 +134,29 @@ while True:
         print("Chatbot: Goodbye 👋")
         break
 
-    # Add user message to history
+    # Store first question
+    if first_question is None:
+        first_question = user_input
+
+    # Save user input to memory
     conversation_history.append({"role": "user", "content": user_input})
 
     # Run search node
     search_result = search_node({"question": user_input})
 
-    # Run LLM node with memory
-    llm_result = llm_node({"question": user_input, "search_result": search_result["search_result"]})
+    # Run LLM node
+    llm_result = llm_node({
+        "question": user_input,
+        "search_result": search_result["search_result"]
+    })
 
-    # Add bot reply to history
+    # Save assistant reply
     conversation_history.append({"role": "assistant", "content": llm_result["answer"]})
+
+    # Special handling for first question inquiry
+    if "first question" in user_input.lower():
+        print(f"Chatbot: You first asked: '{first_question}'\n")
+        continue
 
     # Print reply
     print(f"Chatbot: {llm_result['answer']}\n")
