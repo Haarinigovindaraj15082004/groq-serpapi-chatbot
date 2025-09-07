@@ -2,17 +2,25 @@ import os
 from dotenv import load_dotenv
 from typing import TypedDict
 from langchain_community.utilities import SerpAPIWrapper
-from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.document_loaders import WebBaseLoader, PlaywrightURLLoader
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
+import re
+
+def extract_website(query: str):
+    # Simple regex to detect URL in query
+    match = re.search(r'(https?://[^\s]+)', query)
+    return match.group(0) if match else None
 
 # ---------------------------
 # Conversation memory (short-term)
 # ---------------------------
 conversation_history = []
 MAX_HISTORY = 6  # only last 6 messages to avoid confusion
+turn_counter = 0  # track numbered turns
 current_entity = {"type": None, "name": None}  # entity tracker
 first_question = None  # store first user question
+cached_results = {}  # cache search results per entity
 
 # ---------------------------
 # 1. Load API keys
@@ -41,39 +49,83 @@ llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 # 4. Search Node
 # ---------------------------
 def search_node(state: ChatState):
-    """Call SerpAPI, extract top links, and scrape content from websites."""
-
-    query = state["question"].strip().lower()
+    query = state["question"].strip()
+    website = extract_website(query)
 
     # Handle vague follow-ups
     vague_queries = ["tell me more", "more details", "i want to know more",
                      "tell more about it", "more about the movie",
                      "more about the company", "details please"]
-
-    if any(vq in query for vq in vague_queries) and current_entity["name"]:
+    if any(vq in query.lower() for vq in vague_queries) and current_entity["name"]:
         query = current_entity["name"]
+        website = None  # treat vague query as general entity
 
-    # Perform search
-    search_results = search_tool.results(query)
-    urls = []
-    if search_results and "organic_results" in search_results:
-        urls = [r['link'] for r in search_results["organic_results"][:5]]
+    # ---------------------------
+    # 1️⃣ If query has a website → scrape that directly
+    # ---------------------------
+    if website:
+        urls = [website]
 
+    # ---------------------------
+    # 2️⃣ If no website → search authoritative sources
+    # ---------------------------
+    else:
+        # Add trusted sites if query is about a movie or company
+        if "movie" in query.lower() or "thalapathy" in query.lower():
+            query += " site:wikipedia.org OR site:imdb.com"
+        elif "company" in query.lower():
+            query += " site:linkedin.com OR site:crunchbase.com OR site:glassdoor.com"
+
+        # Use SerpAPI to get top 10 results
+        search_results = search_tool.results(query)
+        urls = [r['link'] for r in search_results.get("organic_results", [])[:10]]
+        # ---------------------------
+        # Filter only trusted sources
+        trusted_sources = ["wikipedia.org", "imdb.com", "linkedin.com", "crunchbase.com"]
+        urls = [url for url in urls if any(t in url for t in trusted_sources)]
+        # ---------------------------
+
+    # ---------------------------
+    # 3️⃣ Scrape URLs
+    # ---------------------------
     page_texts = []
     for url in urls:
+        success = False
         try:
             loader = WebBaseLoader(url)
             docs = loader.load()
-            page_texts.append(docs[0].page_content[:2000])
+            if docs and docs[0].page_content.strip():
+                page_texts.append(docs[0].page_content[:2000])
+                success = True
         except Exception:
-            continue
+            pass
 
-    combined_content = "\n\n".join(page_texts) if page_texts else "No content found from top URLs."
+        # Playwright fallback
+        if not success:
+            try:
+                loader = PlaywrightURLLoader(
+                    urls=[url],
+                    remove_selectors=["script", "style"],
+                    browser_type="chromium",
+                    headless=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/117 Safari/537.36",
+                    timeout=90000
+                )
+                docs = loader.load()
+                if docs and docs[0].page_content.strip():
+                    page_texts.append(docs[0].page_content[:2000])
+            except Exception:
+                continue
 
-    # Update entity if query looks specific
-    if len(state["question"].split()) > 2 and "No content" not in combined_content:
+    combined_content = "\n\n".join(page_texts) if page_texts else ""
+    if not combined_content:
+        return {"search_result": "No reliable content could be retrieved from the web. Please clarify or try again."}
+
+    # Update entity tracking
+    if not any(vq in state["question"].lower() for vq in vague_queries):
         current_entity["name"] = state["question"]
         current_entity["type"] = "general"
+        cached_results[state["question"]] = combined_content
 
     return {"search_result": combined_content}
 
@@ -86,27 +138,57 @@ def llm_node(state: ChatState):
     query = state["question"]
     context = state["search_result"]
 
-    # Use last MAX_HISTORY messages
-    messages = conversation_history[-MAX_HISTORY:]
-
-    chat_prompt = [
-        {"role": "system", "content": """You are a polite, helpful assistant.
-Rules:
-1. Use recent conversation to stay on topic.
-2. If the user asks vague follow-ups (like "tell me more"), use last entity.
-3. Never guess; if unsure, ask the user to clarify.
-4. Keep answers accurate and grounded in search results."""}
+    # Only include user messages in numbered history to avoid repetition
+    numbered_history = [
+        f"{i}. {msg['content']}"
+        for i, msg in enumerate(conversation_history[-MAX_HISTORY:], start=1)
+        if msg["role"] == "user"
     ]
 
-    for msg in messages:
-        chat_prompt.append({"role": msg["role"], "content": msg["content"]})
+    chat_prompt = [
+        {"role": "system", "content": f"""You are a polite, helpful and respectful assistant.
+I am giving you the conversation history below in numbered form:
+{chr(10).join(numbered_history)}
+
+Strict Conversation rules:
+1. Always remember the user’s earlier questions and answers in this chat.
+2. Only connect vague follow-ups (like "tell me more", "details", "about it")
+   to the most recent meaningful question or entity.
+3. If the new question looks specific (like a new company, movie, or person name),
+   treat it as a completely new entity and DO NOT connect it to earlier topics.
+4. If the user asks a vague follow-up like "tell me more", "more details",
+   "about the movie", "about the company", etc., connect it back to the most
+   recent meaningful question or entity they asked about.
+   Example:
+     - Q1: "name of thalapathy 69"
+     - Q2: (irrelevant question)
+     - Q3: "tell more about the movie"
+       → You must understand Q3 refers to the movie from Q1 ("Thalapathy 69" / "Jana Nayagan")
+5. When such follow-ups occur, fetch fresh web information about that entity
+   instead of treating it as a brand-new query.
+6. Do not mix unrelated topics. Stick to either the new question or the last tracked entity.
+7. If you are uncertain about what the user means, politely ask them to clarify
+   instead of guessing or hallucinating.
+8. Use ONLY the retrieved web context when answering.
+9. Do not make up facts or speculate. 
+10. Give direct and concise answer.
+11. If web results are limited, combine available snippets with prior conversation context.
+
+You are a web search assistant. You are given multiple sources of information. 
+- If the sources agree, provide a concise answer. 
+- If the sources conflict, mention the conflict clearly. 
+Example: "Some sources say Nelson is the director, while others mention H. Vinoth."
+- Prefer details from authoritative sites like Wikipedia, IMDb, or official announcements.
+
+"""}
+    ]
 
     chat_prompt.append({"role": "user", "content": query})
 
-    if context and context != "No content found from top URLs.":
+    if context and "No reliable content" not in context:
         chat_prompt.append({
             "role": "system",
-            "content": f"Extra web context:\n{context[:4000]}"
+            "content": f"Extra web context:\n{context[:10000]}"  # increase slice for more context
         })
 
     response = llm.invoke(chat_prompt)
@@ -138,8 +220,11 @@ while True:
     if first_question is None:
         first_question = user_input
 
-    # Save user input to memory
-    conversation_history.append({"role": "user", "content": user_input})
+    # Increment turn counter
+    turn_counter += 1
+
+    # Save numbered user input
+    conversation_history.append({"role": "user", "content": f"[{turn_counter}] {user_input}"})
 
     # Run search node
     search_result = search_node({"question": user_input})
@@ -150,8 +235,8 @@ while True:
         "search_result": search_result["search_result"]
     })
 
-    # Save assistant reply
-    conversation_history.append({"role": "assistant", "content": llm_result["answer"]})
+    # Save numbered assistant reply
+    conversation_history.append({"role": "assistant", "content": f"[{turn_counter}] {llm_result['answer']}"})
 
     # Special handling for first question inquiry
     if "first question" in user_input.lower():
@@ -160,3 +245,4 @@ while True:
 
     # Print reply
     print(f"Chatbot: {llm_result['answer']}\n")
+
