@@ -61,17 +61,17 @@ def search_node(state: ChatState):
         website = None  # treat vague query as general entity
 
     # ---------------------------
-    # 1️⃣ If query has a website → scrape that directly
+    # If query has a website → scrape that directly
     # ---------------------------
     if website:
         urls = [website]
 
     # ---------------------------
-    # 2️⃣ If no website → search authoritative sources
+    # If no website → search authoritative sources
     # ---------------------------
     else:
         # Add trusted sites if query is about a movie or company
-        if "movie" in query.lower() or "thalapathy" in query.lower():
+        if "movie" in query.lower():
             query += " site:wikipedia.org OR site:imdb.com"
         elif "company" in query.lower():
             query += " site:linkedin.com OR site:crunchbase.com OR site:glassdoor.com"
@@ -173,6 +173,7 @@ Strict Conversation rules:
 9. Do not make up facts or speculate. 
 10. Give direct and concise answer.
 11. If web results are limited, combine available snippets with prior conversation context.
+12. Give results in professionaly manner (DO NOT use # or * for bold elements)
 
 You are a web search assistant. You are given multiple sources of information. 
 - If the sources agree, provide a concise answer. 
