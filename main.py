@@ -86,7 +86,7 @@ def search_node(state: ChatState):
         # ---------------------------
 
     # ---------------------------
-    # 3️⃣ Scrape URLs
+    # Scrape URLs
     # ---------------------------
     page_texts = []
     for url in urls:
@@ -169,7 +169,7 @@ Strict Conversation rules:
 6. Do not mix unrelated topics. Stick to either the new question or the last tracked entity.
 7. If you are uncertain about what the user means, politely ask them to clarify
    instead of guessing or hallucinating.
-8. Use ONLY the retrieved web context when answering.
+8. Prefer the retrieved web context. If none is available, answer concisely from general knowledge.
 9. Do not make up facts or speculate. 
 10. Give direct and concise answer.
 11. If web results are limited, combine available snippets with prior conversation context.
@@ -207,17 +207,11 @@ graph.add_edge("llm", END)
 app = graph.compile()
 
 # ---------------------------
-# 7. Run Chatbot
+# 7. Single-turn function for external callers (Flask, etc.)
 # ---------------------------
-print("🤖 Groq + SerpAPI Chatbot ready! Type 'exit' to quit.\n")
+def ask(user_input: str) -> str:
+    global first_question, turn_counter, conversation_history
 
-while True:
-    user_input = input("You: ")
-    if user_input.lower() in ["exit", "quit", "bye"]:
-        print("Chatbot: Goodbye 👋")
-        break
-
-    # Store first question
     if first_question is None:
         first_question = user_input
 
@@ -241,9 +235,19 @@ while True:
 
     # Special handling for first question inquiry
     if "first question" in user_input.lower():
-        print(f"Chatbot: You first asked: '{first_question}'\n")
-        continue
+        return f"You first asked: '{first_question}'"
 
-    # Print reply
-    print(f"Chatbot: {llm_result['answer']}\n")
+    return llm_result["answer"]
 
+# ---------------------------
+# 8. CLI runner (only when executed directly)
+# ---------------------------
+if __name__ == "__main__":
+    print("🤖 Groq + SerpAPI Chatbot ready! Type 'exit' to quit.\n")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() in ["exit", "quit", "bye"]:
+            print("Chatbot: Goodbye 👋")
+            break
+        reply = ask(user_input)
+        print(f"Chatbot: {reply}\n")
